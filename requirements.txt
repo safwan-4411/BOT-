@@ -1,4 +1,4 @@
-nsepython==1.0.6
+nsepython
 schedule==1.2.0
 pandas==2.2.2
 numpy==1.26.4
