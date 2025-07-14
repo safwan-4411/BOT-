@@ -1,66 +1,98 @@
-import time
-import schedule
-from datetime import datetime
-import logging
-from telegram import Bot
-from nsepython import *
+# telegram_stock_bot.py
+import os
 import pandas as pd
+import numpy as np
+import datetime as dt
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import asyncio
+import logging
+from nsepython import nsefetch, index_url, stock_df
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# ========== CONFIG ==========
-TEST_MODE = True  # Set to False to run during live market
-BOT_TOKEN = "8167208295:AAGBUjMy05_tUv8qIpdh6h5mQGK2PJavRbU"
-CHAT_ID = "1436652020"
-NSE_STOCKS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]  # Add more stocks here
-SCAN_TIME = "09:20"  # Scheduled scan time
-# ============================
+# --- Config ---
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")  # Set this in Railway secrets
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")  # Set this in Railway secrets
+STOCK_LIST = ["RELIANCE", "TCS", "INFY", "HDFCBANK"]  # You can replace with your list
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN)
+logging.basicConfig(level=logging.INFO)
 
-# Setup Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(message)s")
+# --- Functions ---
+def calculate_fibonacci_targets(price: float, low: float) -> tuple:
+    diff = price - low
+    tp1 = price + 0.618 * diff
+    tp2 = price + 1.0 * diff
+    sl = low
+    return round(tp1, 2), round(tp2, 2), round(sl, 2)
 
-def send_telegram(message):
-    try:
-        bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-        logging.info(f"✅ Sent to Telegram: {message}")
-    except Exception as e:
-        logging.error(f"❌ Telegram error: {e}")
+def fetch_data(symbol):
+    df = stock_df(symbol)
+    df = df.tail(50)  # Last 50 candles (days)
+    df.columns = [col.lower() for col in df.columns]
+    df.index.name = 'Date'
+    return df
 
-def check_breakout(stock):
-    try:
-        df = nse_eq(stock)
-        df = pd.DataFrame(df)
-        df["lastPrice"] = pd.to_numeric(df["lastPrice"], errors="coerce")
-        price = df["lastPrice"].iloc[0]
-
-        # Simple breakout logic (replace with your real logic)
-        if price > 500:  # Placeholder logic
-            message = f"🚨 *Breakout Detected!*\nStock: `{stock}`\nPrice: ₹{price}"
-            send_telegram(message)
-            return True
-    except Exception as e:
-        logging.error(f"Error checking {stock}: {e}")
+def detect_breakout(df):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    if latest['close'] > prev['high']:
+        return True
     return False
 
-def run_scanner():
-    logging.info("🔍 Running NSE breakout scan...")
-    found = False
-    for stock in NSE_STOCKS:
-        if check_breakout(stock):
-            found = True
+def generate_chart(df, symbol):
+    filename = f"/tmp/{symbol}.png"
+    mpf.plot(df[-20:], type='candle', style='charles', title=symbol,
+             volume=True, mav=(9, 21), savefig=dict(fname=filename, dpi=100))
+    return filename
 
-    if not found:
-        send_telegram("😴 No breakout today. Please rest.")
-        logging.info("📭 No breakout detected.")
+def scan_and_alert():
+    for stock in STOCK_LIST:
+        try:
+            df = fetch_data(stock)
+            if detect_breakout(df):
+                latest = df.iloc[-1]
+                price = latest['close']
+                low = df['low'].iloc[-10:].min()
+                tp1, tp2, sl = calculate_fibonacci_targets(price, low)
 
-if __name__ == "__main__":
-    if TEST_MODE:
-        logging.info("🚧 Running in TEST MODE...")
-        send_telegram("🧪 Test Alert: Bot is working fine ✅")
+                message = f"\n🚀 *Breakout Alert*: {stock} \n\n💰 *CPM*: ₹{price}\n🎯 *TP1*: ₹{tp1}\n🎯 *TP2*: ₹{tp2}\n🛡️ *SL*: ₹{sl}"
+                chart_path = generate_chart(df, stock)
+                bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=open(chart_path, 'rb'), caption=message, parse_mode='Markdown')
+        except Exception as e:
+            logging.warning(f"Error processing {stock}: {e}")
+
+# --- Bot Handlers ---
+def reply_to_query(update: Update, context: CallbackContext):
+    text = update.message.text.upper().strip()
+    stock_name = text.replace("WHAT ABOUT", "").replace("?", "").strip()
+    if stock_name in STOCK_LIST:
+        df = fetch_data(stock_name)
+        latest = df.iloc[-1]
+        price = latest['close']
+        low = df['low'].iloc[-10:].min()
+        tp1, tp2, sl = calculate_fibonacci_targets(price, low)
+        message = f"📊 {stock_name} Analysis:\n💰 Current Price: ₹{price}\n🎯 TP1: ₹{tp1}\n🎯 TP2: ₹{tp2}\n🛡️ SL: ₹{sl}"
+        update.message.reply_text(message)
     else:
-        schedule.every().day.at(SCAN_TIME).do(run_scanner)
-        logging.info(f"⏳ Scheduled scan at {SCAN_TIME} every day.")
+        update.message.reply_text("❌ Stock not in watchlist.")
 
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
+def test_command(update: Update, context: CallbackContext):
+    update.message.reply_text("🧪 Test Alert: Bot is working fine ✅")
+
+# --- Main ---
+def main():
+    scan_and_alert()  # Run once when deployed
+
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("test", test_command))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, reply_to_query))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
